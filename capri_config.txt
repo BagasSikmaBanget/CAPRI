@@ -63,6 +63,14 @@ GLITCH_FPS = 30
 #(imageio-ffmpeg, then ffmpeg on PATH).
 GLITCH_FFMPEG =
 
+#MENU GLITCH
+#Every pet-menu choice (say something, talk to capri, close the pet) tears the
+#current sprite apart before the choice runs. This is independent of the
+#glitch transition clip above.
+MENU_GLITCH_ENABLED = true
+MENU_GLITCH_SECONDS = 0.9
+MENU_GLITCH_FPS = 24
+
 #SAY SOMETHING
 #Left-click the pet, then pick "say something" to make her talk. The two
 #talking frames flap, the border overlays glitch and change colour, and a

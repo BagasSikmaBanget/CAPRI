@@ -336,6 +336,12 @@ class Settings:
         self.glitch_ffmpeg = cfg.get("GLITCH_FFMPEG", "").strip()
         self.glitch_file = path_of("GLITCH_FILE", "action/glitch.mp4")
 
+        self.menu_glitch_enabled = flag("MENU_GLITCH_ENABLED", "true")
+        self.menu_glitch_seconds = _clamp(
+            num("MENU_GLITCH_SECONDS", 0.9), 0.0, 5.0
+        )
+        self.menu_glitch_fps = int(_clamp(num("MENU_GLITCH_FPS", 24), 4, 60))
+
         self.talk_scale = _clamp(num("TALK_SCALE", 0.25), 0.05, 4.0)
         self.talk_bubble_ratio = _clamp(num("TALK_BUBBLE_RATIO", 1.4), 0.3, 6.0)
         self.talk_fps = int(_clamp(num("TALK_FPS", 14), 4, 60))
@@ -926,6 +932,170 @@ class GlitchOverlay:
             pass
 
 
+# ---------------------------------------------------------- menu glitch
+
+SPRITE_GLITCH_PAD = 24
+
+
+def _sprite_image(surf: Surface) -> Image.Image:
+    """Recover an un-premultiplied RGBA image from a Surface."""
+    raw = ctypes.string_at(surf.bits, surf.w * surf.h * 4)
+    img = Image.frombytes("RGBA", (surf.w, surf.h), raw, "raw", "BGRA")
+    px = img.load()
+    for y in range(surf.h):
+        for x in range(surf.w):
+            r, g, b, a = px[x, y]
+            if 0 < a < 255:
+                px[x, y] = (
+                    min(255, (r * 255 + a // 2) // a),
+                    min(255, (g * 255 + a // 2) // a),
+                    min(255, (b * 255 + a // 2) // a),
+                    a,
+                )
+    return img
+
+
+class SpriteGlitch:
+    """Tears the current pet sprite apart before a menu choice runs."""
+
+    def __init__(self, surf: Surface, seconds: float, fps: int):
+        self.seconds = max(0.08, seconds)
+        self.fps = max(4, fps)
+        self.original: Surface | None = surf
+        self.pad = SPRITE_GLITCH_PAD
+        self.base = Image.new(
+            "RGBA",
+            (surf.w + self.pad * 2, surf.h + self.pad * 2),
+            (0, 0, 0, 0),
+        )
+        self.base.alpha_composite(_sprite_image(surf), (self.pad, self.pad))
+        l, t, r, b = surf.box
+        self.box = (l + self.pad, t + self.pad, r + self.pad, b + self.pad)
+        self._alpha = self.base.getchannel("A")
+        self._frames = self._make_frames()
+        self.out: Surface | None = Surface.blank(self.base.width, self.base.height)
+        self.out.box = self.box
+        self.started = time.perf_counter()
+        self._last = -1
+
+    def _make_frames(self) -> list[Image.Image]:
+        count = max(4, round(self.seconds * self.fps))
+        rng = random.Random()
+        return [
+            self._make_frame(i / max(1, count - 1), rng) for i in range(count)
+        ]
+
+    def _make_frame(self, progress: float, rng: random.Random) -> Image.Image:
+        base = self.base
+        alpha = self._alpha
+        w, h = base.size
+        canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+        shift = max(8, round(w * 0.22))
+        y = 0
+        while y < h:
+            band = rng.randint(2, max(4, h // 9))
+            dx = 0
+            if rng.random() < 0.35 + 0.5 * progress:
+                dx = rng.randint(-shift, shift)
+            dy = rng.randint(-12, 12) if rng.random() < 0.12 else 0
+            canvas.alpha_composite(
+                base.crop((0, y, w, min(h, y + band))), (dx, y + dy)
+            )
+            y += band
+
+        for _ in range(rng.randint(0, 2)):
+            y = rng.randint(0, max(0, h - 1))
+            band = rng.randint(2, max(4, h // 6))
+            canvas.alpha_composite(
+                base.crop((0, y, w, min(h, y + band))),
+                (rng.randint(-shift, shift), y),
+            )
+
+        r, g, b, a = canvas.split()
+        split = max(2, round(w * 0.05))
+        r = ImageChops.offset(r, rng.randint(-split, split), 0)
+        b = ImageChops.offset(b, rng.randint(-split, split), 0)
+        canvas = Image.merge("RGBA", (r, g, b, a))
+
+        if rng.random() < 0.5:
+            y = rng.randint(0, max(0, h - 1))
+            band = rng.randint(2, max(3, h // 6))
+            patch = canvas.crop((0, y, w, min(h, y + band)))
+            rgb = ImageChops.invert(patch.convert("RGB"))
+            patch = Image.merge("RGBA", (*rgb.split(), patch.getchannel("A")))
+            canvas.paste(patch, (0, y))
+
+        if rng.random() < 0.35:
+            div = rng.choice((4, 6, 8))
+            small = canvas.resize(
+                (max(2, w // div), max(2, h // div)), Image.NEAREST
+            )
+            canvas = small.resize((w, h), Image.NEAREST)
+
+        if rng.random() < 0.3:
+            colour = rng.choice(
+                (
+                    (255, 40, 90),
+                    (40, 255, 220),
+                    (255, 255, 255),
+                    (0, 0, 0),
+                    (160, 70, 255),
+                )
+            )
+            fx = Image.new("RGBA", (w, h), (*colour, 255))
+            strength = rng.randint(80, 210)
+            fx.putalpha(alpha.point(lambda v: v * strength // 255))
+            canvas = Image.alpha_composite(canvas, fx)
+
+        fx = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(fx)
+        for _ in range(rng.randint(1, 5)):
+            yy = rng.randint(0, max(0, h - 1))
+            bh = rng.randint(1, 3)
+            colour = rng.choice(
+                (
+                    (255, 255, 255),
+                    (0, 0, 0),
+                    (255, 0, 80),
+                    (0, 255, 220),
+                    (255, 240, 0),
+                )
+            )
+            draw.rectangle(
+                (0, yy, w, yy + bh), fill=(*colour, rng.randint(110, 220))
+            )
+        fx.putalpha(ImageChops.multiply(fx.getchannel("A"), alpha))
+        canvas = Image.alpha_composite(canvas, fx)
+
+        if progress > 0.7 and rng.random() < 0.35:
+            colour = rng.choice(((255, 255, 255), (255, 40, 90), (40, 255, 220)))
+            flash = Image.new("RGBA", (w, h), (*colour, 255))
+            flash.putalpha(alpha)
+            canvas = flash
+        return canvas
+
+    def frame(self, now: float) -> Surface:
+        idx = min(
+            len(self._frames) - 1,
+            max(0, int((now - self.started) * self.fps)),
+        )
+        if idx != self._last:
+            self._last = idx
+            if self.out is not None:
+                self.out.set_image(self._frames[idx], self.box)
+        return self.out  # type: ignore[return-value]
+
+    def close(self) -> None:
+        if self.out is not None:
+            self.out.free()
+            self.out = None
+        self._frames = []
+        self.base = None  # type: ignore[assignment]
+        self._alpha = None  # type: ignore[assignment]
+        self.original = None
+
+
 # ---------------------------------------------------------- say something
 
 # Border recolours the talking frame cycles through. The first entries match the
@@ -1334,6 +1504,8 @@ class Pet:
         self.glitch: GlitchOverlay | None = None
         self.pending_menu: str | None = None
         self.menu_lock = threading.Lock()
+        self.menu_glitch: SpriteGlitch | None = None
+        self.menu_action: str | None = None
 
         self.mode = "idle"
         self.mode_timer = 0.0
@@ -1462,10 +1634,17 @@ class Pet:
             self.talk.close()
             self.talk = None
 
+    def _dispose_menu_glitch(self) -> None:
+        if self.menu_glitch is not None:
+            self.menu_glitch.close()
+            self.menu_glitch = None
+        self.menu_action = None
+
     def reload(self) -> None:
         print("[capri] reloading config + art")
         self._cancel_transition()
         self._dispose_talk()
+        self._dispose_menu_glitch()
         self.dragging = False
         self._drag_origin = None
         self._drag_moved = False
@@ -1835,15 +2014,58 @@ class Pet:
     def _consume_menu(self) -> None:
         with self.menu_lock:
             action, self.pending_menu = self.pending_menu, None
-        if action is None:
+        if action is None or self.menu_glitch is not None:
             return
         print(f"[capri] menu action: {action}")
+        if action in ("quit", "chat", "say"):
+            self._begin_menu_glitch(action)
+
+    def _begin_menu_glitch(self, action: str) -> None:
+        surf = self.current
+        seconds = self.settings.menu_glitch_seconds
+        if (
+            not self.settings.menu_glitch_enabled
+            or seconds <= 0.0
+            or surf is None
+        ):
+            self._cancel_transition()
+            self._apply_menu_action(action)
+            return
+        self._cancel_transition()
+        try:
+            self.menu_glitch = SpriteGlitch(
+                surf, seconds, self.settings.menu_glitch_fps
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[capri] menu glitch failed: {exc}")
+            self._apply_menu_action(action)
+            return
+        self.menu_action = action
+        print(f"[capri] menu glitch -> {action}")
+
+    def _finish_menu_glitch(self) -> None:
+        glitch, self.menu_glitch = self.menu_glitch, None
+        action, self.menu_action = self.menu_action, None
+        if glitch is not None:
+            original = glitch.original
+            glitch.close()
+            if original is not None:
+                self.current = original
+                try:
+                    self._blit(original)
+                except Exception:  # noqa: BLE001
+                    pass
+        if action is not None:
+            self._apply_menu_action(action)
+
+    def _apply_menu_action(self, action: str) -> None:
         if action == "quit":
+            print("[capri] closing pet")
             self.running = False
         elif action == "chat":
             self.open_chat()
         elif action == "say":
-            self._say_something()
+            self._say_something_now()
 
     def _on_chat_state(self, is_open: bool, win: ChatWindow | None = None) -> None:
         """Called from the chat thread - only flips a flag."""
@@ -1855,25 +2077,29 @@ class Pet:
 
     # ---- say something
 
-    def _say_something(self) -> None:
+    def _pick_line(self) -> str | None:
         if not self.words:
             print("[capri] no words to say")
-            return
-        if self.transition is not None:
-            return
+            return None
+        choices = [w for w in self.words if w != self.last_said] or self.words
+        line = random.choice(choices)
+        self.last_said = line
+        return line
+
+    def _close_chat_for_talk(self) -> None:
         if self.chat_open:
             with self.chat_lock:
                 self.chat_open = False
             if self.chat is not None:
                 self.chat.close()
-        choices = [w for w in self.words if w != self.last_said] or self.words
-        line = random.choice(choices)
-        self.last_said = line
-        self._pending_line = line
-        if self.mode == "talk":
-            self._start_talk()
+
+    def _say_something_now(self) -> None:
+        line = self._pick_line()
+        if line is None:
             return
-        self._begin_transition("talk")
+        self._close_chat_for_talk()
+        self._pending_line = line
+        self._start_talk()
 
     def _talk_duration(self, line: str) -> float:
         seconds = len(line) / self.settings.talk_type_cps + self.settings.talk_hold_seconds
@@ -2010,6 +2236,11 @@ class Pet:
         if not self.running:
             return
 
+        if self.menu_glitch is not None:
+            if now - self.menu_glitch.started >= self.menu_glitch.seconds:
+                self._finish_menu_glitch()
+            return
+
         if (
             self.transition is None
             and not self.chat_open
@@ -2071,6 +2302,11 @@ class Pet:
                 self.think()
 
     def render(self) -> None:
+        if self.menu_glitch is not None:
+            surf = self.menu_glitch.frame(time.perf_counter())
+            self.current = surf
+            self._blit(surf)
+            return
         if self.transition is not None:
             return
         if self.mode == "talk" and self.talk is not None:
@@ -2131,6 +2367,7 @@ class Pet:
             self.dragging = False
         self._cancel_transition()
         self._dispose_talk()
+        self._dispose_menu_glitch()
         if self.glitch is not None:
             self.glitch.close()
             self.glitch = None
