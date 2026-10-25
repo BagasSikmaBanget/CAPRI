@@ -1,0 +1,7 @@
+[capri] hotkey ctrl+alt+q -> id 1
+[capri] hotkey ctrl+alt+r -> id 2
+[capri] glitch transition off (GLITCH_ENABLED is off)
+[capri] running. Ctrl+Alt+Q quits, Ctrl+Alt+R reloads.
+[capri] menu choice: chat
+[capri] menu action: chat
+[capri] chat opened
