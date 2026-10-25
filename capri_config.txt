@@ -50,31 +50,19 @@ EYE_GLANCE_MAX = 4
 QUIT_HOTKEY = ctrl+alt+q
 RELOAD_HOTKEY = ctrl+alt+r
 
-#GLITCH TRANSITION
-#A boosted glitch distortion swallows the model and spills a little around
-#her body before every action change, so the art swap is hidden inside it.
-#Set GLITCH_ENABLED = false for instant changes.
+#SPRITE GLITCH
+#Every pose change (idle, idle2, walk, talk) and every pet-menu choice tears
+#the current sprite apart before switching. Set GLITCH_ENABLED = false for
+#instant changes.
 GLITCH_ENABLED = true
-GLITCH_FILE = action/glitch.mp4
-#Seconds of the clip to play before switching.
-GLITCH_DURATION = 1.01
-GLITCH_FPS = 30
-#Optional path to ffmpeg.exe. Leave empty to auto-detect
-#(imageio-ffmpeg, then ffmpeg on PATH).
-GLITCH_FFMPEG =
-
-#MENU GLITCH
-#Every pet-menu choice (say something, talk to capri, close the pet) tears the
-#current sprite apart before the choice runs. This is independent of the
-#glitch transition clip above.
-MENU_GLITCH_ENABLED = true
-MENU_GLITCH_SECONDS = 0.9
-MENU_GLITCH_FPS = 24
+GLITCH_DURATION = 0.9
+GLITCH_FPS = 24
 
 #SAY SOMETHING
 #Left-click the pet, then pick "say something" to make her talk. The two
 #talking frames flap, the border overlays glitch and change colour, and a
-#line from words.txt appears in the speech bubble.
+#line from words.txt appears in the speech bubble. When the line finishes she
+#holds talking0 until you click her again or TALK_WAIT_SECONDS passes.
 TALK_FILE_0 = action/talking0.png
 TALK_FILE_1 = action/talking1.png
 TALK_OVERLAY_0 = Capri stuff/Overlay/overlay0.png
@@ -90,11 +78,8 @@ TALK_BUBBLE_RATIO = 1.4
 TALK_FPS = 14
 #Typewriter speed (characters per second).
 TALK_TYPE_CPS = 24
-#How long the finished line stays up after typing finishes.
-TALK_HOLD_SECONDS = 1.8
-#Clamp for the total time a line stays on screen.
-TALK_MIN_SECONDS = 3
-TALK_MAX_SECONDS = 8
+#Seconds to hold talking0 after the line finishes before returning to idle.
+TALK_WAIT_SECONDS = 5
 
 #CHAT
 #Left-click the pet, then pick "talk to capri" to open the chat box.

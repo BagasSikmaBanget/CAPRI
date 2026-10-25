@@ -9,12 +9,13 @@ Reload art/config with  Ctrl+Alt+R
 Drag her anywhere to move her.
 Left-click her for a small menu: "say something" loops the talking art inside
 a glitching colour-cycling border and shows a random words.txt line in a speech
-bubble; "talk to capri" opens the chat box.
+bubble; "talk to capri" opens the chat box. After a line finishes she holds the
+talking0 pose until clicked again or TALK_WAIT_SECONDS passes.
 
-Every action change is hidden behind a glitch distortion
-(action/glitch.mp4) that runs over her body for about a second first.
+Every pose and menu change tears the current sprite apart for GLITCH_DURATION
+seconds before the next one appears.
 
-Runs on the standard library + Pillow, plus ffmpeg for the glitch clip.
+Runs on the standard library + Pillow.
 """
 
 from __future__ import annotations
@@ -24,13 +25,11 @@ import ctypes.wintypes as wt
 import math
 import os
 import random
-import shutil
-import subprocess
 import sys
 import threading
 import time
 
-from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 from chat import ChatWindow
 
@@ -331,26 +330,14 @@ class Settings:
         self.reload_hotkey = cfg.get("RELOAD_HOTKEY", "ctrl+alt+r")
 
         self.glitch_enabled = flag("GLITCH_ENABLED", "true")
-        self.glitch_duration = _clamp(num("GLITCH_DURATION", 1.01), 0.05, 30.0)
-        self.glitch_fps = int(_clamp(num("GLITCH_FPS", 30), 1, 60))
-        self.glitch_ffmpeg = cfg.get("GLITCH_FFMPEG", "").strip()
-        self.glitch_file = path_of("GLITCH_FILE", "action/glitch.mp4")
-
-        self.menu_glitch_enabled = flag("MENU_GLITCH_ENABLED", "true")
-        self.menu_glitch_seconds = _clamp(
-            num("MENU_GLITCH_SECONDS", 0.9), 0.0, 5.0
-        )
-        self.menu_glitch_fps = int(_clamp(num("MENU_GLITCH_FPS", 24), 4, 60))
+        self.glitch_duration = _clamp(num("GLITCH_DURATION", 0.9), 0.0, 5.0)
+        self.glitch_fps = int(_clamp(num("GLITCH_FPS", 24), 4, 60))
 
         self.talk_scale = _clamp(num("TALK_SCALE", 0.25), 0.05, 4.0)
         self.talk_bubble_ratio = _clamp(num("TALK_BUBBLE_RATIO", 1.4), 0.3, 6.0)
         self.talk_fps = int(_clamp(num("TALK_FPS", 14), 4, 60))
-        self.talk_min_seconds = max(1.0, num("TALK_MIN_SECONDS", 3.0))
-        self.talk_max_seconds = max(
-            self.talk_min_seconds, num("TALK_MAX_SECONDS", 8.0)
-        )
         self.talk_type_cps = max(4.0, num("TALK_TYPE_CPS", 24.0))
-        self.talk_hold_seconds = max(0.2, num("TALK_HOLD_SECONDS", 1.8))
+        self.talk_wait_seconds = max(0.0, num("TALK_WAIT_SECONDS", 5.0))
         self.talk_file0 = path_of("TALK_FILE_0", "action/talking0.png")
         self.talk_file1 = path_of("TALK_FILE_1", "action/talking1.png")
         self.talk_overlays = [
@@ -598,341 +585,7 @@ class GazeFace:
         self._center.close()
 
 
-# ------------------------------------------------------------- glitch video
-
-GLITCH_PAD = 12
-GLITCH_GAIN = 2.2
-
-
-def _boost(v: int) -> int:
-    return min(255, round(v * GLITCH_GAIN))
-
-
-def find_ffmpeg(explicit: str = "") -> str | None:
-    if explicit:
-        path = explicit.replace("\\", "/")
-        if not os.path.isabs(path):
-            path = os.path.join(HERE, path)
-        if os.path.isfile(path):
-            return path
-    try:
-        import imageio_ffmpeg  # type: ignore
-
-        path = imageio_ffmpeg.get_ffmpeg_exe()
-        if path and os.path.isfile(path):
-            return path
-    except Exception:  # noqa: BLE001
-        pass
-    return shutil.which("ffmpeg")
-
-
-class GlitchOverlay:
-    """Distortion that swallows the pet and spills around her silhouette."""
-
-    def __init__(self, settings: Settings, hinst):
-        self.duration = settings.glitch_duration
-        self.fps = max(1, settings.glitch_fps)
-        self.path = settings.glitch_file
-        self.ffmpeg = find_ffmpeg(settings.glitch_ffmpeg)
-
-        self.dw = 2
-        self.dh = 2
-        self.frame_bytes = 12
-        self.buf = ctypes.create_string_buffer(self.frame_bytes)
-        self.bmi = BITMAPINFO()
-        self.pet_rgb: Image.Image | None = None
-        self.pet_a: Image.Image | None = None
-        self.halo: Image.Image | None = None
-        self.out: Surface | None = None
-        self.ox = 0
-        self.oy = 0
-
-        self.enabled = bool(
-            settings.glitch_enabled
-            and self.ffmpeg
-            and os.path.isfile(self.path)
-            and self.duration > 0
-        )
-        self.proc: subprocess.Popen | None = None
-        self.active = False
-        self.next_frame_at = 0.0
-        self.ow = 1
-        self.oh = 1
-        self.hwnd = None
-        self.wndproc_ref = None
-        self.brush = None
-
-        if self.enabled:
-            self._create_window()
-        else:
-            reason = "disabled"
-            if not settings.glitch_enabled:
-                reason = "GLITCH_ENABLED is off"
-            elif not self.ffmpeg:
-                reason = "no ffmpeg found"
-            elif not os.path.isfile(self.path):
-                reason = f"missing {self.path}"
-            print(f"[capri] glitch transition off ({reason})")
-
-    def _setup_frame(self, w: int, h: int) -> None:
-        self.dw = max(1, w)
-        self.dh = max(1, h)
-        self.frame_bytes = self.dw * self.dh * 3
-        self.buf = ctypes.create_string_buffer(self.frame_bytes)
-        head = self.bmi.bmiHeader
-        head.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        head.biWidth = self.dw
-        head.biHeight = -self.dh
-        head.biPlanes = 1
-        head.biBitCount = 24
-        head.biCompression = BI_RGB
-        head.biSizeImage = self.frame_bytes
-
-    def reconfigure(self, settings: Settings) -> None:
-        self.stop()
-        self.duration = settings.glitch_duration
-        self.fps = max(1, settings.glitch_fps)
-        self.path = settings.glitch_file
-        self.ffmpeg = find_ffmpeg(settings.glitch_ffmpeg)
-        self.enabled = bool(
-            settings.glitch_enabled
-            and self.ffmpeg
-            and os.path.isfile(self.path)
-            and self.duration > 0
-        )
-        if self.enabled and self.hwnd is None:
-            self._create_window()
-        print(
-            f"[capri] glitch transition {'on' if self.enabled else 'off'}"
-            f" ({self.duration:.2f}s @ {self.fps}fps)"
-        )
-
-    # ---- window
-
-    def _create_window(self) -> None:
-        def proc(hwnd, msg, wparam, lparam):
-            if msg == WM_DESTROY:
-                return 0
-            return user32.DefWindowProcW(
-                wt.HWND(hwnd), UINT(msg), wt.WPARAM(wparam), wt.LPARAM(lparam)
-            )
-
-        self.wndproc_ref = WNDPROC(proc)
-        self.brush = gdi32.CreateSolidBrush(0)
-
-        wc = WNDCLASSW()
-        wc.style = 0
-        wc.lpfnWndProc = self.wndproc_ref
-        wc.cbClsExtra = 0
-        wc.cbWndExtra = 0
-        wc.hInstance = kernel32.GetModuleHandleW(None)
-        wc.hIcon = None
-        wc.hCursor = None
-        wc.hbrBackground = self.brush
-        wc.lpszMenuName = None
-        wc.lpszClassName = "CapriGlitchWindow"
-        if not user32.RegisterClassW(ctypes.byref(wc)):
-            err = ctypes.get_last_error()
-            if err != 1410:
-                print(f"[capri] glitch window class failed ({err})")
-                self.enabled = False
-                return
-
-        ex = (
-            WS_EX_LAYERED
-            | WS_EX_TOPMOST
-            | WS_EX_TOOLWINDOW
-            | WS_EX_NOACTIVATE
-            | WS_EX_TRANSPARENT
-        )
-        self.hwnd = user32.CreateWindowExW(
-            ex, "CapriGlitchWindow", "Capri", WS_POPUP,
-            0, 0, 1, 1, None, None, wc.hInstance, None,
-        )
-        if not self.hwnd:
-            print(f"[capri] glitch window failed ({ctypes.get_last_error()})")
-            self.enabled = False
-
-    def _cmd(self) -> list[str]:
-        return [
-            self.ffmpeg or "ffmpeg",
-            "-hide_banner", "-loglevel", "error",
-            "-i", self.path,
-            "-t", f"{self.duration + 0.3:.3f}",
-            "-vf", f"fps={self.fps},scale={self.dw}:{self.dh}",
-            "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
-        ]
-
-    # ---- playback
-
-    def start(self, x: int, y: int, surf: Surface, pet_hwnd=None) -> bool:
-        if not self.enabled or self.hwnd is None or self.active:
-            return False
-        if surf is None or surf.bits is None or surf.w < 1 or surf.h < 1:
-            return False
-        self._kill_proc()
-        pad = GLITCH_PAD
-        self.ox, self.oy = int(x) - pad, int(y) - pad
-        self.ow, self.oh = surf.w + pad * 2, surf.h + pad * 2
-        self._setup_frame(self.ow, self.oh)
-        raw = ctypes.string_at(surf.bits, surf.w * surf.h * 4)
-        pet = Image.frombuffer(
-            "RGBA", (surf.w, surf.h), raw, "raw", "BGRA", 0, 1
-        )
-        canvas = Image.new("RGBA", (self.ow, self.oh), (0, 0, 0, 0))
-        canvas.paste(pet, (pad, pad))
-        self.pet_rgb = canvas.convert("RGB")
-        self.pet_a = canvas.getchannel("A")
-        self.halo = (
-            self.pet_a.filter(ImageFilter.MaxFilter(7))
-            .filter(ImageFilter.GaussianBlur(2.5))
-        )
-        if self.out is None or self.out.w != self.ow or self.out.h != self.oh:
-            if self.out is not None:
-                self.out.free()
-            self.out = Surface.blank(self.ow, self.oh)
-        try:
-            self.proc = subprocess.Popen(
-                self._cmd(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[capri] glitch ffmpeg failed: {exc}")
-            return False
-        if not self._read_frame():
-            self._kill_proc()
-            return False
-        self._blit()
-        above = user32.GetWindow(pet_hwnd, GW_HWNDPREV) if pet_hwnd else None
-        while above and int(above) == int(self.hwnd):
-            above = user32.GetWindow(above, GW_HWNDPREV)
-        user32.SetWindowPos(
-            self.hwnd,
-            above if above else HWND_TOPMOST,
-            self.ox, self.oy, self.ow, self.oh,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        )
-        self.active = True
-        self.next_frame_at = time.perf_counter() + 1.0 / self.fps
-        return True
-
-    def tick(self, now: float) -> None:
-        if not self.active:
-            return
-        for _ in range(4):
-            if now < self.next_frame_at:
-                break
-            if not self._read_frame():
-                break
-            self._blit()
-            self.next_frame_at += 1.0 / self.fps
-
-    def stop(self) -> None:
-        self.active = False
-        self._hide()
-        self._kill_proc()
-
-    def close(self) -> None:
-        self.stop()
-        if self.out is not None:
-            self.out.free()
-            self.out = None
-        self.pet_rgb = None
-        self.pet_a = None
-        self.halo = None
-        if self.hwnd is not None:
-            try:
-                user32.DestroyWindow(self.hwnd)
-            except Exception:  # noqa: BLE001
-                pass
-            self.hwnd = None
-        if self.brush is not None:
-            try:
-                gdi32.DeleteObject(self.brush)
-            except Exception:  # noqa: BLE001
-                pass
-            self.brush = None
-
-    def _read_frame(self) -> bool:
-        if self.proc is None or self.proc.stdout is None:
-            return False
-        data = self.proc.stdout.read(self.frame_bytes)
-        if not data or len(data) < self.frame_bytes:
-            return False
-        ctypes.memmove(self.buf, data, self.frame_bytes)
-        return True
-
-    def _blit(self) -> None:
-        if (
-            self.hwnd is None
-            or self.out is None
-            or self.pet_rgb is None
-            or self.pet_a is None
-            or self.halo is None
-        ):
-            return
-        raw = ctypes.string_at(self.buf, self.frame_bytes)
-        glitch = Image.frombuffer(
-            "RGB", (self.ow, self.oh), raw, "raw", "RGB", 0, 1
-        ).point(_boost)
-        weight = ImageChops.multiply(self.halo, glitch.convert("L"))
-        rest = ImageChops.invert(weight)
-        weight3 = Image.merge("RGB", (weight, weight, weight))
-        rest3 = Image.merge("RGB", (rest, rest, rest))
-        rgb = ImageChops.add(
-            ImageChops.multiply(glitch, weight3),
-            ImageChops.multiply(self.pet_rgb, rest3),
-        )
-        alpha = ImageChops.add(
-            weight, ImageChops.multiply(self.pet_a, rest)
-        )
-        rgba = Image.merge("RGBA", (*rgb.split(), alpha))
-        ctypes.memmove(
-            self.out.bits, rgba.tobytes("raw", "BGRA"), self.ow * self.oh * 4
-        )
-
-        screen = user32.GetDC(None)
-        try:
-            blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
-            dst = POINT(self.ox, self.oy)
-            size = SIZE(self.ow, self.oh)
-            src = POINT(0, 0)
-            user32.UpdateLayeredWindow(
-                self.hwnd, screen, ctypes.byref(dst), ctypes.byref(size),
-                self.out.hdc, ctypes.byref(src), 0, ctypes.byref(blend),
-                ULW_ALPHA,
-            )
-        finally:
-            user32.ReleaseDC(None, screen)
-
-    def _hide(self) -> None:
-        if self.hwnd is not None:
-            user32.ShowWindow(self.hwnd, SW_HIDE)
-
-    def _kill_proc(self) -> None:
-        proc, self.proc = self.proc, None
-        if proc is None:
-            return
-        try:
-            if proc.stdout is not None:
-                proc.stdout.close()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            if proc.poll() is None:
-                proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            proc.wait(timeout=1.0)
-        except Exception:  # noqa: BLE001
-            pass
-
-
-# ---------------------------------------------------------- menu glitch
+# ---------------------------------------------------------- sprite glitch
 
 SPRITE_GLITCH_PAD = 24
 
@@ -956,7 +609,7 @@ def _sprite_image(surf: Surface) -> Image.Image:
 
 
 class SpriteGlitch:
-    """Tears the current pet sprite apart before a menu choice runs."""
+    """Tears the current pet sprite apart before a pose or menu change runs."""
 
     def __init__(self, surf: Surface, seconds: float, fps: int):
         self.seconds = max(0.08, seconds)
@@ -972,18 +625,12 @@ class SpriteGlitch:
         l, t, r, b = surf.box
         self.box = (l + self.pad, t + self.pad, r + self.pad, b + self.pad)
         self._alpha = self.base.getchannel("A")
-        self._frames = self._make_frames()
+        self._count = max(4, round(self.seconds * self.fps))
+        self._rng = random.Random()
         self.out: Surface | None = Surface.blank(self.base.width, self.base.height)
         self.out.box = self.box
         self.started = time.perf_counter()
         self._last = -1
-
-    def _make_frames(self) -> list[Image.Image]:
-        count = max(4, round(self.seconds * self.fps))
-        rng = random.Random()
-        return [
-            self._make_frame(i / max(1, count - 1), rng) for i in range(count)
-        ]
 
     def _make_frame(self, progress: float, rng: random.Random) -> Image.Image:
         base = self.base
@@ -1077,20 +724,21 @@ class SpriteGlitch:
 
     def frame(self, now: float) -> Surface:
         idx = min(
-            len(self._frames) - 1,
+            self._count - 1,
             max(0, int((now - self.started) * self.fps)),
         )
         if idx != self._last:
             self._last = idx
+            progress = idx / max(1, self._count - 1)
+            img = self._make_frame(progress, self._rng)
             if self.out is not None:
-                self.out.set_image(self._frames[idx], self.box)
+                self.out.set_image(img, self.box)
         return self.out  # type: ignore[return-value]
 
     def close(self) -> None:
         if self.out is not None:
             self.out.free()
             self.out = None
-        self._frames = []
         self.base = None  # type: ignore[assignment]
         self._alpha = None  # type: ignore[assignment]
         self.original = None
@@ -1183,6 +831,8 @@ class TalkRenderer:
         self._bubble_notext: Image.Image | None = None
         self._text_lines: list[str] = [""]
         self._text_total = 0
+        self.typing_seconds = 0.0
+        self.settled = False
         self._text_font = ImageFont.load_default()
         self._text_origin = (0, 0)
         self._text_size = 12
@@ -1344,6 +994,8 @@ class TalkRenderer:
         self._started_at = None
         self._reveal = -1
         self._caret_on = True
+        self.settled = False
+        self.typing_seconds = max(0.0, (self._text_total - 1) / self._type_cps)
         self._mouth = 0
         self._next_mouth = 0.0
         self._tint = TALK_PALETTE[0]
@@ -1366,6 +1018,13 @@ class TalkRenderer:
 
     def restart(self, settings: Settings, line: str) -> None:
         self._build(settings, line)
+
+    def rest(self) -> None:
+        """Hold the closed-mouth talking pose while the bubble stays visible."""
+        self.settled = True
+        self._mouth = 0
+        self._glitch_img = None
+        self._next_glitch = 0.0
 
     # ---- animation
 
@@ -1443,7 +1102,7 @@ class TalkRenderer:
 
     def frame(self, now: float) -> Surface:
         changed = self._refresh_text(now)
-        if now >= self._next_mouth:
+        if not self.settled and now >= self._next_mouth:
             self._mouth ^= 1
             self._next_mouth = now + self._rng.uniform(0.09, 0.19)
             changed = True
@@ -1500,12 +1159,9 @@ class Pet:
         self._drag_moved = False
 
         self.transition: str | None = None
-        self.transition_start = 0.0
-        self.glitch: GlitchOverlay | None = None
+        self.sprite_glitch: SpriteGlitch | None = None
         self.pending_menu: str | None = None
         self.menu_lock = threading.Lock()
-        self.menu_glitch: SpriteGlitch | None = None
-        self.menu_action: str | None = None
 
         self.mode = "idle"
         self.mode_timer = 0.0
@@ -1529,14 +1185,14 @@ class Pet:
         self._topmost_at = 0.0
 
         self.talk: TalkRenderer | None = None
-        self.talk_until = 0.0
+        self.talk_typing_until = 0.0
+        self.talk_wait_until = 0.0
         self._pending_line: str | None = None
         self.words = self._load_words()
         self.last_said: str | None = None
 
         self.load_art()
         self._create_window()
-        self.glitch = GlitchOverlay(self.settings, self._hinst)
 
     # ---- layout
 
@@ -1629,22 +1285,16 @@ class Pet:
 
     def _dispose_talk(self) -> None:
         self._pending_line = None
-        self.talk_until = 0.0
+        self.talk_typing_until = 0.0
+        self.talk_wait_until = 0.0
         if self.talk is not None:
             self.talk.close()
             self.talk = None
-
-    def _dispose_menu_glitch(self) -> None:
-        if self.menu_glitch is not None:
-            self.menu_glitch.close()
-            self.menu_glitch = None
-        self.menu_action = None
 
     def reload(self) -> None:
         print("[capri] reloading config + art")
         self._cancel_transition()
         self._dispose_talk()
-        self._dispose_menu_glitch()
         self.dragging = False
         self._drag_origin = None
         self._drag_moved = False
@@ -1660,9 +1310,6 @@ class Pet:
         self.baseline = self._baseline()
         self.words = self._load_words()
         self.load_art()
-
-        if self.glitch is not None:
-            self.glitch.reconfigure(self.settings)
 
         self._unregister_hotkeys()
         self._register_hotkey(1, self.settings.quit_hotkey)
@@ -1905,6 +1552,9 @@ class Pet:
         except Exception:  # noqa: BLE001
             pass
         if not self._drag_moved:
+            if self.mode in ("talk", "talk_wait"):
+                self._end_talk_click()
+                return
             if sx is None or sy is None:
                 p = POINT()
                 if not user32.GetCursorPos(ctypes.byref(p)):
@@ -1923,33 +1573,54 @@ class Pet:
 
     # ---- glitch transitions
 
-    def _begin_transition(self, action: str) -> None:
+    def _begin_transition(self, action: str, force: bool = False) -> None:
         if self.transition is not None:
-            return
+            if not force:
+                return
+            self._cancel_transition()
         surf = self.current
-        if (
-            surf is not None
-            and self.glitch is not None
-            and self.glitch.start(self.left, self.top, surf, self.hwnd)
-        ):
-            self.transition = action
-            self.transition_start = time.perf_counter()
+        seconds = self.settings.glitch_duration
+        if surf is None or not self.settings.glitch_enabled or seconds <= 0.0:
+            self._apply_action(action)
             return
-        self._apply_action(action)
+        try:
+            self.sprite_glitch = SpriteGlitch(surf, seconds, self.settings.glitch_fps)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[capri] glitch failed: {exc}")
+            self._apply_action(action)
+            return
+        self.transition = action
 
     def _finish_transition(self) -> None:
+        glitch, self.sprite_glitch = self.sprite_glitch, None
         action, self.transition = self.transition, None
-        if self.glitch is not None:
-            self.glitch.stop()
+        if glitch is not None:
+            original = glitch.original
+            glitch.close()
+            if original is not None:
+                self.current = original
+                try:
+                    self._blit(original)
+                except Exception:  # noqa: BLE001
+                    pass
         if action is not None:
             self._apply_action(action)
 
     def _cancel_transition(self) -> None:
-        if self.transition is None:
+        if self.transition is None and self.sprite_glitch is None:
             return
         self.transition = None
-        if self.glitch is not None:
-            self.glitch.stop()
+        glitch, self.sprite_glitch = self.sprite_glitch, None
+        if glitch is None:
+            return
+        original = glitch.original
+        glitch.close()
+        if original is not None:
+            self.current = original
+            try:
+                self._blit(original)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _apply_action(self, action: str) -> None:
         if action == "walk":
@@ -1957,6 +1628,13 @@ class Pet:
             print(f"[capri] walk -> {self.walk_target:.0f}")
         elif action == "talk":
             self._start_talk()
+        elif action == "say":
+            self._say_something_now()
+        elif action == "chat":
+            self.open_chat()
+        elif action == "quit":
+            print("[capri] closing pet")
+            self.running = False
         elif action == "idle2":
             self.mode = "idle2"
             self.mode_timer = self.settings.idle2_duration
@@ -2014,58 +1692,11 @@ class Pet:
     def _consume_menu(self) -> None:
         with self.menu_lock:
             action, self.pending_menu = self.pending_menu, None
-        if action is None or self.menu_glitch is not None:
+        if action is None:
             return
         print(f"[capri] menu action: {action}")
         if action in ("quit", "chat", "say"):
-            self._begin_menu_glitch(action)
-
-    def _begin_menu_glitch(self, action: str) -> None:
-        surf = self.current
-        seconds = self.settings.menu_glitch_seconds
-        if (
-            not self.settings.menu_glitch_enabled
-            or seconds <= 0.0
-            or surf is None
-        ):
-            self._cancel_transition()
-            self._apply_menu_action(action)
-            return
-        self._cancel_transition()
-        try:
-            self.menu_glitch = SpriteGlitch(
-                surf, seconds, self.settings.menu_glitch_fps
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[capri] menu glitch failed: {exc}")
-            self._apply_menu_action(action)
-            return
-        self.menu_action = action
-        print(f"[capri] menu glitch -> {action}")
-
-    def _finish_menu_glitch(self) -> None:
-        glitch, self.menu_glitch = self.menu_glitch, None
-        action, self.menu_action = self.menu_action, None
-        if glitch is not None:
-            original = glitch.original
-            glitch.close()
-            if original is not None:
-                self.current = original
-                try:
-                    self._blit(original)
-                except Exception:  # noqa: BLE001
-                    pass
-        if action is not None:
-            self._apply_menu_action(action)
-
-    def _apply_menu_action(self, action: str) -> None:
-        if action == "quit":
-            print("[capri] closing pet")
-            self.running = False
-        elif action == "chat":
-            self.open_chat()
-        elif action == "say":
-            self._say_something_now()
+            self._begin_transition(action, force=True)
 
     def _on_chat_state(self, is_open: bool, win: ChatWindow | None = None) -> None:
         """Called from the chat thread - only flips a flag."""
@@ -2101,10 +1732,6 @@ class Pet:
         self._pending_line = line
         self._start_talk()
 
-    def _talk_duration(self, line: str) -> float:
-        seconds = len(line) / self.settings.talk_type_cps + self.settings.talk_hold_seconds
-        return _clamp(seconds, self.settings.talk_min_seconds, self.settings.talk_max_seconds)
-
     def _start_talk(self) -> None:
         line = self._pending_line
         self._pending_line = None
@@ -2122,15 +1749,36 @@ class Pet:
             return
         self.mode = "talk"
         self.eye_track = False
-        self.talk_until = time.perf_counter() + self._talk_duration(line)
-        self.current = self.talk.frame(time.perf_counter())
+        now = time.perf_counter()
+        self.talk_typing_until = now + max(0.3, self.talk.typing_seconds) + 0.08
+        self.talk_wait_until = 0.0
+        self.current = self.talk.frame(now)
         self._clamp_position()
         print(f"[capri] says: {line}")
 
+    def _settle_talk(self) -> None:
+        if self.talk is None:
+            self._enter_idle()
+            return
+        self.talk.rest()
+        self.mode = "talk_wait"
+        self.talk_wait_until = (
+            time.perf_counter() + self.settings.talk_wait_seconds
+        )
+        print("[capri] talk done; click or wait to close")
+
+    def _end_talk_click(self) -> None:
+        self._pending_line = None
+        self.talk_typing_until = 0.0
+        self.talk_wait_until = 0.0
+        if self.mode in ("talk", "talk_wait"):
+            self._begin_transition("idle")
+
     def _end_talk(self) -> None:
         self._pending_line = None
-        self.talk_until = 0.0
-        if self.mode == "talk":
+        self.talk_typing_until = 0.0
+        self.talk_wait_until = 0.0
+        if self.mode in ("talk", "talk_wait"):
             self._enter_idle()
 
     # ---- behaviour
@@ -2236,28 +1884,19 @@ class Pet:
         if not self.running:
             return
 
-        if self.menu_glitch is not None:
-            if now - self.menu_glitch.started >= self.menu_glitch.seconds:
-                self._finish_menu_glitch()
+        if self.transition is not None:
+            glitch = self.sprite_glitch
+            if glitch is None or now - glitch.started >= glitch.seconds:
+                self._finish_transition()
             return
 
         if (
-            self.transition is None
-            and not self.chat_open
+            not self.chat_open
             and now - self._topmost_at > 1.0
             and not self._tk_menu_open()
         ):
             self._apply_topmost()
             self._topmost_at = now
-
-        if self.transition is not None:
-            glitch = self.glitch
-            if glitch is not None:
-                glitch.tick(now)
-                if now - self.transition_start < glitch.duration:
-                    return
-            self._finish_transition()
-            return
 
         if self.dragging:
             if self.mode == "idle":
@@ -2265,7 +1904,12 @@ class Pet:
             return
 
         if self.mode == "talk":
-            if now >= self.talk_until:
+            if now >= self.talk_typing_until:
+                self._settle_talk()
+            return
+
+        if self.mode == "talk_wait":
+            if now >= self.talk_wait_until:
                 self._begin_transition("idle")
             return
 
@@ -2302,14 +1946,12 @@ class Pet:
                 self.think()
 
     def render(self) -> None:
-        if self.menu_glitch is not None:
-            surf = self.menu_glitch.frame(time.perf_counter())
+        if self.sprite_glitch is not None:
+            surf = self.sprite_glitch.frame(time.perf_counter())
             self.current = surf
             self._blit(surf)
             return
-        if self.transition is not None:
-            return
-        if self.mode == "talk" and self.talk is not None:
+        if self.mode in ("talk", "talk_wait") and self.talk is not None:
             surf = self.talk.frame(time.perf_counter())
         elif self.mode == "idle" and self.face is not None:
             surf = self.face.draw(int(round(self.eye_dx)), int(round(self.eye_dy)))
@@ -2367,10 +2009,6 @@ class Pet:
             self.dragging = False
         self._cancel_transition()
         self._dispose_talk()
-        self._dispose_menu_glitch()
-        if self.glitch is not None:
-            self.glitch.close()
-            self.glitch = None
         chat = self.chat
         self.chat = None
         if chat is not None:
