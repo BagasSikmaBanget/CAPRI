@@ -1,5 +1,7 @@
 # capri-demo
 
+This is my personal project, which I’ve combined with the “https://github.com/mochiiwuff/capri-desktop” project.
+
 A Windows desktop pet that reacts to **Claude Code** while it works.
 
 She is built on [CAPRI](../CAPRI) (the Python/Pillow/ctypes desktop pet) and
